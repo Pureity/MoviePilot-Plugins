@@ -1,0 +1,13 @@
+{
+  "MusicOrganizer": {
+    "name": "MusicOrganizer",
+    "description": "音乐硬链接整理：基于文件名智能识别 Artist/Album 结构，无需刮削元数据，支持 PT 命名规范。",
+    "author": "YourName",
+    "version": "1.1",
+    "level": 2,
+    "icon": "music",
+    "history": {
+      "1.1": "初始版本：支持文件名正则解析与硬链接整理"
+    }
+  }
+}
