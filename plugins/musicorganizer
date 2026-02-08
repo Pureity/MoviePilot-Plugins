@@ -1,0 +1,307 @@
+import os
+import re
+import shutil
+import logging
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+from app.plugins import _PluginBase
+from app.core.event import eventmanager
+
+logger = logging.getLogger(__name__)
+
+class MusicOrganizer(_PluginBase):
+    def __init__(self):
+        super().__init__()
+
+    def init_config(self) -> dict:
+        return {
+            "enabled": False,
+            "cron_expression": "*/30 * * * *",
+            "source_path": "/mnt/user/downloads/music",
+            "dest_path": "/mnt/user/media/music",
+            "extensions": "mp3,flac,wav,m4a,ape,dsf,dff",
+            "structure_pattern": "{Artist}/{Album}/{Track} - {Title}{Ext}"
+        }
+
+    def get_page(self) -> List[dict]:
+        return [
+            {
+                "component": "VForm",
+                "content": [
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "enabled",
+                                            "label": "启用插件"
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "cron_expression",
+                                            "label": "执行周期 (Cron)",
+                                            "placeholder": "*/30 * * * *"
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "source_path",
+                                            "label": "源文件夹 (监控目录)",
+                                            "hint": "PT下载的原始音乐保存目录"
+                                        }
+                                    },
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "dest_path",
+                                            "label": "目标文件夹 (媒体库)",
+                                            "hint": "整理后的存放位置 (需与源目录在同一磁盘以支持硬链接)"
+                                        }
+                                    },
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "extensions",
+                                            "label": "监控扩展名",
+                                            "hint": "mp3,flac,wav,m4a,ape"
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                         "component": "VAlert",
+                         "props": {
+                             "type": "info",
+                             "variant": "tonal",
+                             "text": "本插件优先使用文件名解析。处理逻辑：\n1. 如果文件名包含 ' - '，尝试切分 '艺术家 - 歌名' 或 '艺术家 - 专辑 - 歌名'。\n2. 如果文件在子文件夹中，尝试从父文件夹名提取 '艺术家 - 专辑'，从文件名提取 '音轨 - 歌名'。\n3. 会自动过滤文件夹名中的 (Year) [Format] 等后缀。"
+                         }
+                    }
+                ]
+            }
+        ]
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        if self.get_config("enabled"):
+            return [{
+                "id": "MusicOrganizer_Task",
+                "name": "音乐整理(文件名解析)",
+                "trigger": "cron",
+                "func": self.organize_task,
+                "kwargs": {
+                    "expression": self.get_config("cron_expression")
+                }
+            }]
+        return []
+
+    def organize_task(self):
+        source = self.get_config("source_path")
+        dest = self.get_config("dest_path")
+        exts = self.get_config("extensions")
+
+        if not source or not dest:
+            logger.error("【MusicOrganizer】未配置源目录或目标目录")
+            return
+
+        if not os.path.exists(source):
+            logger.error(f"【MusicOrganizer】源目录不存在: {source}")
+            return
+
+        logger.info(f"【MusicOrganizer】开始扫描: {source}")
+        self._process_directory(source, dest, exts)
+        logger.info("【MusicOrganizer】任务结束")
+
+    def _process_directory(self, source_dir: str, dest_dir: str, extensions: str):
+        ext_list = [e.strip().lower() for e in extensions.split(',')]
+        
+        # 使用 os.walk 遍历，topdown=True 以便获取文件夹名称
+        for root, dirs, files in os.walk(source_dir):
+            for file in files:
+                # 排除隐藏文件
+                if file.startswith('.'):
+                    continue
+                
+                file_path = Path(root) / file
+                
+                # 检查扩展名
+                if file_path.suffix.lower().replace('.', '') not in ext_list:
+                    continue
+
+                # 防止处理目标目录（如果源和目标重叠）
+                if dest_dir in str(file_path):
+                    continue
+
+                try:
+                    self._organize_file(file_path, Path(source_dir), Path(dest_dir))
+                except Exception as e:
+                    logger.error(f"【MusicOrganizer】处理失败 {file}: {str(e)}")
+
+    def _organize_file(self, file_path: Path, source_root: Path, dest_root: Path):
+        """
+        核心逻辑：解析文件名 -> 生成路径 -> 硬链接
+        """
+        # 1. 智能解析信息 (Artist, Album, Title, Track)
+        info = self._parse_info(file_path, source_root)
+        
+        if not info:
+            logger.warning(f"【MusicOrganizer】无法识别文件名结构，跳过: {file_path.name}")
+            return
+
+        artist = self._clean_str(info.get('artist', 'Unknown Artist'))
+        album = self._clean_str(info.get('album', 'Unknown Album'))
+        title = self._clean_str(info.get('title', file_path.stem))
+        track = info.get('track', '')
+
+        # 2. 构建目标文件名
+        # 格式: 01 - Title.ext
+        if track:
+            new_filename = f"{track} - {title}{file_path.suffix}"
+        else:
+            new_filename = f"{title}{file_path.suffix}"
+
+        # 3. 构建目标全路径
+        target_dir = dest_root / artist / album
+        target_file = target_dir / new_filename
+
+        # 4. 执行链接
+        if target_file.exists():
+            # 检查是否是同一文件
+            try:
+                if target_file.stat().st_ino == file_path.stat().st_ino:
+                    return 
+            except:
+                pass
+            logger.info(f"【MusicOrganizer】目标已存在(跳过): {target_file.name}")
+            return
+
+        if not target_dir.exists():
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            os.link(file_path, target_file)
+            logger.info(f"【MusicOrganizer】✅ {artist} - {title}")
+        except OSError as e:
+            if e.errno == 18: 
+                logger.error(f"【MusicOrganizer】❌ 跨设备链接失败: 源与目标不在同一分区")
+            else:
+                logger.error(f"【MusicOrganizer】❌ 链接错误: {str(e)}")
+
+    def _parse_info(self, file_path: Path, source_root: Path) -> Optional[Dict]:
+        """
+        智能解析文件名和文件夹名
+        """
+        filename = file_path.stem # 不含后缀
+        parent_name = file_path.parent.name
+        
+        # 策略A: 强规则 - 文件名本身包含完整信息 
+        # 格式: Artist - Album - Track - Title
+        # 格式: Artist - Album - Title
+        parts = filename.split(' - ')
+        if len(parts) >= 3:
+            # 假设: Artist - Album - Title (或 Track - Title)
+            # 这里比较难猜，先尝试用文件夹策略，如果文件夹策略失败再回退到这里
+            pass
+
+        # 策略B (推荐): 文件夹即专辑模式 (PT常用)
+        # 路径结构: /.../Artist - Album (Year)/01. Title.flac
+        
+        # 1. 尝试解析父文件夹名称
+        # 清洗掉 PT 常见的后缀: (2022), [FLAC], [Web], {CD1}
+        clean_parent = re.sub(r'[\(\[\{].*?[\)\]\}]', '', parent_name).strip()
+        
+        folder_artist = "Unknown Artist"
+        folder_album = "Unknown Album"
+        
+        if ' - ' in clean_parent:
+            # 父文件夹名包含 ' - '，通常是 'Artist - Album'
+            p_parts = clean_parent.split(' - ')
+            folder_artist = p_parts[0].strip()
+            folder_album = ' - '.join(p_parts[1:]).strip()
+        elif clean_parent and clean_parent != source_root.name:
+            # 父文件夹没有 ' - '，可能整个文件夹就是专辑名，或者源目录结构是 Artist/Album/File
+            # 尝试向上找一级
+            grandparent_name = file_path.parent.parent.name
+            if file_path.parent.parent != source_root and grandparent_name:
+                 # 结构: /Artist/Album/File
+                 folder_artist = grandparent_name
+                 folder_album = clean_parent
+            else:
+                 # 结构: /Album/File (无法得知Artist)
+                 folder_album = clean_parent
+
+        # 2. 尝试解析文件名 (获取 Track 和 Title)
+        # 常见格式: "01. Title", "01 - Title", "01 Title"
+        # 正则匹配开头的数字
+        track = ""
+        title = filename
+        
+        match = re.match(r'^(\d+)[\s\.\-_]+(.+)', filename)
+        if match:
+            track = match.group(1) # 数字部分
+            title = match.group(2) # 剩余部分
+            
+            # 补零 (1 -> 01)
+            try:
+                track = f"{int(track):02d}"
+            except:
+                pass
+        
+        # 如果文件名本身包含 ' - ' 且之前没解析出 Artist (单文件情况)
+        if folder_artist == "Unknown Artist" and ' - ' in filename:
+             parts = filename.split(' - ')
+             if len(parts) == 2:
+                 # Artist - Title
+                 folder_artist = parts[0].strip()
+                 title = parts[1].strip()
+             elif len(parts) >= 3:
+                 # Artist - Album - Title
+                 folder_artist = parts[0].strip()
+                 folder_album = parts[1].strip()
+                 title = ' - '.join(parts[2:]).strip()
+                 # 重新检查title里是否有音轨号
+                 match_t = re.match(r'^(\d+)[\s\.\-_]+(.+)', title)
+                 if match_t:
+                     track = f"{int(match_t.group(1)):02d}"
+                     title = match_t.group(2)
+
+        return {
+            "artist": folder_artist,
+            "album": folder_album,
+            "title": title,
+            "track": track
+        }
+
+    def _clean_str(self, s: str) -> str:
+        """
+        清理路径非法字符
+        """
+        # 移除 / \ : * ? " < > |
+        s = re.sub(r'[\\/*?:"<>|]', "", str(s))
+        return s.strip()
